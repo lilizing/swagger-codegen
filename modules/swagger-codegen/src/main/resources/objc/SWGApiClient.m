@@ -16,7 +16,7 @@ static LogRequestsFilterBlock gLogRequestsFilterBlock = nil;
 @implementation SWGApiClient(private)
 
 - (void) _logResponseWithId:(NSNumber *)requestId
-                  operation:(AFHTTPRequestOperation *)operation
+                  operation:(NSURLSessionTask *)operation
                    duration:(NSTimeInterval)duration
                 decodedData:(id)decodedData
                       error:(NSError *)error {
@@ -24,7 +24,7 @@ static LogRequestsFilterBlock gLogRequestsFilterBlock = nil;
         return;
     }
 
-    NSURLRequest *request = operation.request;
+    NSURLRequest *request = operation.originalRequest ? operation.originalRequest : operation.currentRequest;
 
     if (gLogRequestsFilterBlock && !gLogRequestsFilterBlock(self, request, decodedData, error)) {
         return;
@@ -39,7 +39,7 @@ static LogRequestsFilterBlock gLogRequestsFilterBlock = nil;
         }
         else {
             NSString *dataString = nil;
-            NSUInteger dataLength = operation.responseData.length;
+            long long dataLength = operation.response.expectedContentLength;
 
             if (decodedData) {
                 NSData *dataObj = nil;
@@ -67,7 +67,7 @@ static LogRequestsFilterBlock gLogRequestsFilterBlock = nil;
             DDLogDebug(@"[SWGApiClient] request[#%@][%lldms][%lldbyte] %@ - response data:⏎\n%@ ",
                     requestId,
                     durationMS,
-                    (long long)dataLength,
+                    dataLength,
                     requestURLStr,
                     dataString ? dataString : decodedData);
         }
@@ -88,15 +88,15 @@ static LogRequestsFilterBlock gLogRequestsFilterBlock = nil;
     return @(nextId);
 }
 
-- (void) _queueRequestOperation:(AFHTTPRequestOperation *)requestOperation
+- (void) _queueRequestOperation:(NSURLSessionTask *)requestOperation
                          withId:(NSNumber *) requestId{
     @synchronized(queuedRequestsDict) {
         [queuedRequestsDict setObject:requestOperation forKey:requestId];
     }
 }
 
-- (AFHTTPRequestOperation *) _finishRequestWithId:(NSNumber*) requestId {
-    AFHTTPRequestOperation *result = nil;
+- (NSURLSessionTask *) _finishRequestWithId:(NSNumber*) requestId {
+    NSURLSessionTask *result = nil;
 
     @synchronized(queuedRequestsDict) {
         result = [queuedRequestsDict objectForKey:requestId];
@@ -327,6 +327,7 @@ static LogRequestsFilterBlock gLogRequestsFilterBlock = nil;
     // auth setting
     [self updateHeaderParams:&headerParams queryParams:&queryParams WithAuthSettings:authSettings];
 
+    NSError *serializationError = nil;
     NSMutableURLRequest * request = nil;
     if (body != nil && [body isKindOfClass:[NSArray class]]){
         SWGFile * file;
@@ -364,7 +365,7 @@ static LogRequestsFilterBlock gLogRequestsFilterBlock = nil;
                                                        }
 
                                                    }
-                                                                       error:nil];
+                                                                       error:&serializationError];
         }
         // request with form parameters or json
         else {
@@ -374,7 +375,7 @@ static LogRequestsFilterBlock gLogRequestsFilterBlock = nil;
             request = [self.requestSerializer requestWithMethod:method
                                                       URLString:urlString
                                                      parameters:params
-                                                          error:nil];
+                                                          error:&serializationError];
         }
     }
     else {
@@ -384,7 +385,7 @@ static LogRequestsFilterBlock gLogRequestsFilterBlock = nil;
         request = [self.requestSerializer requestWithMethod:method
                                                   URLString:urlString
                                                  parameters:body
-                                                      error:nil];
+                                                      error:&serializationError];
     }
 
     for(NSString * key in [headerParams keyEnumerator]){
@@ -407,54 +408,55 @@ static LogRequestsFilterBlock gLogRequestsFilterBlock = nil;
         }];
     }
 
-    AFHTTPRequestOperation *operation = \
-    [self HTTPRequestOperationWithRequest:request
-                                  success:^(AFHTTPRequestOperation *operation, id data) {
-                                      if([weakSelf _finishRequestWithId:requestId]) {
-                                          NSTimeInterval duration = [[NSDate date] timeIntervalSinceDate:requestStartDate];
-                                          [weakSelf _logResponseWithId:requestId
-                                                             operation:operation
-                                                              duration:duration
-                                                           decodedData:data
-                                                                 error:nil];
+    __block NSURLSessionDataTask *dataTask = nil;
+    dataTask = [self dataTaskWithRequest:request
+                          uploadProgress:nil
+                        downloadProgress:nil
+                       completionHandler:^(NSURLResponse * __unused response, id responseObject, NSError *error) {
+                           if (error) {
+                               if([weakSelf _finishRequestWithId:requestId]) {
+                                   NSMutableDictionary *userInfo = [error.userInfo mutableCopy];
 
-                                          completionBlock(data, nil);
-                                      }
-                                  }
-                                  failure:^(AFHTTPRequestOperation *operation, NSError *error) {
+                                   if(responseObject) {
+                                       // Add in the (parsed) response body.
+                                       userInfo[SWGResponseObjectErrorKey] = responseObject;
+                                   }
+                                   NSError *augmentedError = [error initWithDomain:error.domain
+                                                                              code:error.code
+                                                                          userInfo:userInfo];
 
-                                      if([weakSelf _finishRequestWithId:requestId]) {
-                                          NSMutableDictionary *userInfo = [error.userInfo mutableCopy];
+                                   NSTimeInterval duration = [[NSDate date] timeIntervalSinceDate:requestStartDate];
+                                   [weakSelf _logResponseWithId:requestId
+                                                      operation:dataTask
+                                                       duration:duration
+                                                    decodedData:nil
+                                                          error:augmentedError];
 
-                                          if(operation.responseObject) {
-                                              // Add in the (parsed) response body.
-                                              userInfo[SWGResponseObjectErrorKey] = operation.responseObject;
-                                          }
-                                          NSError *augmentedError = [error initWithDomain:error.domain
-                                                                                     code:error.code
-                                                                                 userInfo:userInfo];
+                                   completionBlock(nil, augmentedError);
+                               }
+                           } else {
+                               if([weakSelf _finishRequestWithId:requestId]) {
+                                   NSTimeInterval duration = [[NSDate date] timeIntervalSinceDate:requestStartDate];
+                                   [weakSelf _logResponseWithId:requestId
+                                                      operation:dataTask
+                                                       duration:duration
+                                                    decodedData:responseObject
+                                                          error:nil];
 
-                                          NSTimeInterval duration = [[NSDate date] timeIntervalSinceDate:requestStartDate];
-                                          [weakSelf _logResponseWithId:requestId
-                                                             operation:operation
-                                                              duration:duration
-                                                           decodedData:nil
-                                                                 error:augmentedError];
+                                   completionBlock(responseObject, nil);
+                               }
+                           }
+                       }];
 
-                                          completionBlock(nil, augmentedError);
-                                      }
-                                  }
-     ];
+    [dataTask resume];
 
-    [self.operationQueue addOperation:operation];
-
-    [self _queueRequestOperation:operation withId:requestId];
+    [self _queueRequestOperation:dataTask withId:requestId];
 
     return requestId;
 }
 
 - (void) cancelRequest:(NSNumber*)requestId {
-    AFHTTPRequestOperation *operation = [self _finishRequestWithId:requestId];
+    NSURLSessionTask *operation = [self _finishRequestWithId:requestId];
     [operation cancel];
 }
 
